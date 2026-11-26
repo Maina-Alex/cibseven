@@ -65,7 +65,9 @@ public class ClusterSafeJobExecutor extends JobExecutor {
   /**
    * One task queue name shared by every engine node in the cluster. Must be identical across all
    * {@code ClusterSafeJobExecutor} instances that are meant to cooperate - a per-node queue name
-   * is exactly the bug this class exists to avoid.
+   * is exactly the bug this class exists to avoid. Enforced structurally, not just by convention:
+   * {@link #startExecutingJobs()} refuses to start a node whose value disagrees with what this
+   * cluster's shared engine database already recorded (see {@link RegisterOrVerifySharedTaskQueueCmd}).
    */
   private final String sharedTaskQueueName;
   private final WorkflowClient workflowClient;
@@ -88,6 +90,12 @@ public class ClusterSafeJobExecutor extends JobExecutor {
   protected void startExecutingJobs() {
     ProcessEngineImpl engine = getProcessEngines().get(0);
     CommandExecutor commandExecutor = engine.getProcessEngineConfiguration().getCommandExecutorTxRequired();
+
+    // Structural guard against §10 risk 12's exact misconfiguration: refuse to start rather
+    // than run with a queue name that disagrees with what this cluster's shared database has
+    // already recorded. Must run before the worker factory comes up - a node that fails this
+    // check must never claim or dispatch a single job.
+    commandExecutor.execute(new RegisterOrVerifySharedTaskQueueCmd(sharedTaskQueueName));
 
     workerFactory = WorkerFactory.newInstance(workflowClient);
     Worker worker = workerFactory.newWorker(sharedTaskQueueName);
@@ -137,6 +145,26 @@ public class ClusterSafeJobExecutor extends JobExecutor {
    */
   public List<String> triggerAcquisitionCycle() {
     return acquireAndDispatch();
+  }
+
+  /**
+   * Test-only hook simulating an abrupt crash of this node's live worker - as opposed to the
+   * graceful {@link #shutdown()}, which this deliberately does not call. Uses
+   * {@link WorkerFactory#shutdownNow()} to forcibly interrupt whatever activity task that worker
+   * is currently executing, rather than letting it run to completion, so a test can prove recovery
+   * for a node that dies <em>while</em> executing a job - the case
+   * {@code dispatchingNodeWithNoLiveWorkerDoesNotOrphanTheJob} does not cover, since there a node
+   * never starts a worker at all.
+   */
+  public void simulateCrashOfLiveWorker() {
+    if (sweepExecutor != null) {
+      sweepExecutor.shutdownNow();
+      sweepExecutor = null;
+    }
+    if (workerFactory != null) {
+      workerFactory.shutdownNow();
+      workerFactory = null;
+    }
   }
 
   private void startSweep() {

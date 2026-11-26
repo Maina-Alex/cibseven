@@ -14,6 +14,7 @@
 package org.cibseven.bpm.flow.jobexecutor;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.List;
 import java.util.UUID;
@@ -62,6 +63,23 @@ class ClusterSafeJobExecutorMultiNodeTest {
           <sequenceFlow id="f1" sourceRef="start" targetRef="asyncTask" />
           <serviceTask id="asyncTask" camunda:asyncBefore="true"
                        camunda:class="org.cibseven.bpm.flow.jobexecutor.NoopServiceDelegate" />
+          <sequenceFlow id="f2" sourceRef="asyncTask" targetRef="end" />
+          <endEvent id="end" />
+        </process>
+      </definitions>
+      """;
+
+  private static final String BLOCKING_PROCESS_XML = """
+      <?xml version="1.0" encoding="UTF-8"?>
+      <definitions xmlns="http://www.omg.org/spec/BPMN/20100524/MODEL"
+                   xmlns:camunda="http://camunda.org/schema/1.0/bpmn"
+                   id="definitions"
+                   targetNamespace="http://cibseven.org/flow/jobexecutor/test">
+        <process id="blockingAsyncJobProcess" isExecutable="true">
+          <startEvent id="start" />
+          <sequenceFlow id="f1" sourceRef="start" targetRef="asyncTask" />
+          <serviceTask id="asyncTask" camunda:asyncBefore="true"
+                       camunda:class="org.cibseven.bpm.flow.jobexecutor.BlockingThenFastServiceDelegate" />
           <sequenceFlow id="f2" sourceRef="asyncTask" targetRef="end" />
           <endEvent id="end" />
         </process>
@@ -191,6 +209,94 @@ class ClusterSafeJobExecutorMultiNodeTest {
     awaitJobGone(managementServiceA, jobId);
   }
 
+  @Test
+  void refusesToStartWhenConfiguredWithADifferentQueueNameThanTheRestOfTheCluster() throws Exception {
+    String dbName = "queue-guard-" + UUID.randomUUID();
+    WorkflowClient workflowClient = newWorkflowClient();
+
+    // Node A starts first and, in doing so, registers "queue-a" as this cluster's canonical
+    // shared queue name (RegisterOrVerifySharedTaskQueueCmd, first writer wins).
+    executorA = new ClusterSafeJobExecutor(workflowClient, "queue-a-" + dbName, Long.MAX_VALUE / 2);
+    engineA = buildEngine(dbName, "node-A-" + dbName, executorA);
+    executorA.start();
+
+    // Node B is misconfigured with a different queue name than node A already registered -
+    // exactly the misconfiguration docs/cib7-fork-engine-plan.md §10 risk 12 warns would silently
+    // reintroduce the lost-job bug if nothing caught it. It must refuse to start.
+    executorB = new ClusterSafeJobExecutor(workflowClient, "queue-b-" + dbName, Long.MAX_VALUE / 2);
+    engineB = buildEngine(dbName, "node-B-" + dbName, executorB);
+
+    assertThatThrownBy(executorB::start)
+        .as("a node configured with a shared task queue name that disagrees with what this "
+            + "cluster's engine database already recorded must refuse to start")
+        .isInstanceOf(IllegalStateException.class)
+        .hasMessageContaining("queue-a-" + dbName)
+        .hasMessageContaining("queue-b-" + dbName);
+
+    // Confirm the refusal was real, not cosmetic: node B never came up as a worker at all, so a
+    // job dispatched to node A's queue has only node A's worker to run it.
+    engineA.getRepositoryService().createDeployment().addString("asyncJobProcess.bpmn", PROCESS_XML).deploy();
+    ProcessInstance instance = engineA.getRuntimeService().startProcessInstanceByKey("asyncJobProcess");
+    ManagementService managementServiceA = engineA.getManagementService();
+    Job job = managementServiceA.createJobQuery().processInstanceId(instance.getId()).singleResult();
+    assertThat(job).isNotNull();
+    executorA.triggerAcquisitionCycle();
+    awaitJobGone(managementServiceA, job.getId());
+  }
+
+  @Test
+  void aNodeThatCrashesWhileAWorkerIsMidActivityStillGetsTheJobCompletedByASurvivor() throws Exception {
+    BlockingThenFastServiceDelegate.reset();
+    String dbName = "mid-activity-crash-" + UUID.randomUUID();
+    String taskQueue = "flow-job-executor-test-" + UUID.randomUUID();
+    WorkflowClient workflowClient = newWorkflowClient();
+
+    executorA = new ClusterSafeJobExecutor(workflowClient, taskQueue, Long.MAX_VALUE / 2);
+    executorB = new ClusterSafeJobExecutor(workflowClient, taskQueue, Long.MAX_VALUE / 2);
+    engineA = buildEngine(dbName, "node-A-" + dbName, executorA);
+    engineB = buildEngine(dbName, "node-B-" + dbName, executorB);
+
+    engineA.getRepositoryService().createDeployment().addString("blockingAsyncJobProcess.bpmn", BLOCKING_PROCESS_XML).deploy();
+    ProcessInstance instance = engineA.getRuntimeService().startProcessInstanceByKey("blockingAsyncJobProcess");
+    ManagementService managementServiceA = engineA.getManagementService();
+    Job job = managementServiceA.createJobQuery().processInstanceId(instance.getId()).singleResult();
+    assertThat(job).isNotNull();
+    String jobId = job.getId();
+
+    // Node A alone claims and dispatches, then its own live worker genuinely starts executing
+    // the activity - this is the case dispatchingNodeWithNoLiveWorkerDoesNotOrphanTheJob does not
+    // cover (there, node A never starts a worker at all).
+    executorA.start();
+    List<String> claimedByA = executorA.triggerAcquisitionCycle();
+    assertThat(claimedByA).containsExactly(jobId);
+
+    boolean genuinelyStarted = BlockingThenFastServiceDelegate.awaitFirstInvocationStarted(30);
+    assertThat(genuinelyStarted)
+        .as("the activity must be observably mid-execution on node A before node A is crashed, "
+            + "or this test would not actually be proving recovery from an in-flight crash")
+        .isTrue();
+
+    long crashedAtMillis = System.currentTimeMillis();
+    // The crash: forcibly interrupt node A's worker mid-activity, instead of a graceful shutdown
+    // that would wait for the (120s-sleeping) activity to finish on its own.
+    executorA.simulateCrashOfLiveWorker();
+
+    // A surviving node comes up on the same shared queue - the only way this job can now be
+    // completed, since node A's worker is gone for good and never restarts in this test.
+    executorB.start();
+
+    awaitJobGone(managementServiceA, jobId, 60_000);
+    long recoveredAfterMillis = System.currentTimeMillis() - crashedAtMillis;
+    System.out.println("[mid-activity-crash test] job recovered " + recoveredAfterMillis
+        + "ms after the crashed node's worker was killed (StartToCloseTimeout=30s, no heartbeat "
+        + "timeout configured, so Temporal's own timeout is expected to dominate this duration)");
+
+    assertThat(BlockingThenFastServiceDelegate.invocationCount())
+        .as("the delegate must have been re-invoked by the retry (attempt 1 was the one that got "
+            + "killed mid-sleep; completion requires a second, distinct invocation)")
+        .isGreaterThanOrEqualTo(2);
+  }
+
   private static ProcessEngine buildEngine(String dbName, String engineName, ClusterSafeJobExecutor jobExecutor) {
     StandaloneInMemProcessEngineConfiguration config = new StandaloneInMemProcessEngineConfiguration();
     config.setProcessEngineName(engineName);
@@ -213,7 +319,11 @@ class ClusterSafeJobExecutorMultiNodeTest {
   }
 
   private static void awaitJobGone(ManagementService managementService, String jobId) throws InterruptedException {
-    long deadline = System.currentTimeMillis() + 20_000;
+    awaitJobGone(managementService, jobId, 20_000);
+  }
+
+  private static void awaitJobGone(ManagementService managementService, String jobId, long timeoutMillis) throws InterruptedException {
+    long deadline = System.currentTimeMillis() + timeoutMillis;
     while (System.currentTimeMillis() < deadline) {
       if (managementService.createJobQuery().jobId(jobId).singleResult() == null) {
         return;
