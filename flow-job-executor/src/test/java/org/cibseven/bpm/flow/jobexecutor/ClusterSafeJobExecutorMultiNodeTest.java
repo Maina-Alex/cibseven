@@ -17,6 +17,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.CyclicBarrier;
@@ -30,7 +31,9 @@ import org.cibseven.bpm.engine.ProcessEngine;
 import org.cibseven.bpm.engine.ProcessEngineConfiguration;
 import org.cibseven.bpm.engine.RepositoryService;
 import org.cibseven.bpm.engine.RuntimeService;
+import org.cibseven.bpm.engine.impl.ProcessEngineImpl;
 import org.cibseven.bpm.engine.impl.cfg.StandaloneInMemProcessEngineConfiguration;
+import org.cibseven.bpm.engine.impl.interceptor.CommandExecutor;
 import org.cibseven.bpm.engine.runtime.Job;
 import org.cibseven.bpm.engine.runtime.ProcessInstance;
 import org.junit.jupiter.api.AfterEach;
@@ -38,6 +41,7 @@ import org.junit.jupiter.api.Test;
 
 import io.temporal.client.WorkflowClient;
 import io.temporal.client.WorkflowClientOptions;
+import io.temporal.client.WorkflowOptions;
 import io.temporal.serviceclient.WorkflowServiceStubs;
 import io.temporal.serviceclient.WorkflowServiceStubsOptions;
 
@@ -295,6 +299,111 @@ class ClusterSafeJobExecutorMultiNodeTest {
         .as("the delegate must have been re-invoked by the retry (attempt 1 was the one that got "
             + "killed mid-sleep; completion requires a second, distinct invocation)")
         .isGreaterThanOrEqualTo(2);
+  }
+
+  @Test
+  void twoDifferentSchemaIncarnationsWithTheSameSmallJobIdDoNotCollideOnTheSharedTemporalServer() throws Exception {
+    // Reproduces the exact scenario that used to lose a job: two *different* engine schemas
+    // (simulating a dev/staging reset, a DR restore, or simply re-running this suite against an
+    // already-used long-lived Temporal server) each producing their own job id starting from a
+    // fresh id-generator watermark - so both commonly land on the same small integer - dispatched
+    // to the *same* Temporal server on the *same* task queue. Before the installation-fingerprint
+    // fix, the second job's dispatch would silently collide with the first job's already-completed
+    // workflow under the same derived id and never run; afterwards, both must complete normally.
+    String taskQueue = "flow-job-executor-test-shared-" + UUID.randomUUID();
+    WorkflowClient workflowClient = newWorkflowClient();
+
+    String dbName1 = "incarnation-1-" + UUID.randomUUID();
+    executorA = new ClusterSafeJobExecutor(workflowClient, taskQueue, Long.MAX_VALUE / 2);
+    engineA = buildEngine(dbName1, "node-" + dbName1, executorA);
+    engineA.getRepositoryService().createDeployment().addString("asyncJobProcess.bpmn", PROCESS_XML).deploy();
+    ProcessInstance instance1 = engineA.getRuntimeService().startProcessInstanceByKey("asyncJobProcess");
+    ManagementService managementService1 = engineA.getManagementService();
+    Job job1 = managementService1.createJobQuery().processInstanceId(instance1.getId()).singleResult();
+    assertThat(job1).isNotNull();
+    String jobId1 = job1.getId();
+
+    executorA.start();
+    assertThat(executorA.triggerAcquisitionCycle()).containsExactly(jobId1);
+    awaitJobGone(managementService1, jobId1);
+
+    // First "incarnation" is done and torn down entirely - its engine, its executor, its worker.
+    executorA.shutdown();
+    engineA.close();
+
+    // Second, independent engine - a genuinely fresh H2 schema, so its own id generator restarts
+    // its watermark from scratch, dispatched to the exact same still-running Temporal server and
+    // the exact same shared task queue name as the first.
+    String dbName2 = "incarnation-2-" + UUID.randomUUID();
+    executorB = new ClusterSafeJobExecutor(workflowClient, taskQueue, Long.MAX_VALUE / 2);
+    engineB = buildEngine(dbName2, "node-" + dbName2, executorB);
+    engineB.getRepositoryService().createDeployment().addString("asyncJobProcess.bpmn", PROCESS_XML).deploy();
+    ProcessInstance instance2 = engineB.getRuntimeService().startProcessInstanceByKey("asyncJobProcess");
+    ManagementService managementService2 = engineB.getManagementService();
+    Job job2 = managementService2.createJobQuery().processInstanceId(instance2.getId()).singleResult();
+    assertThat(job2).isNotNull();
+    String jobId2 = job2.getId();
+
+    System.out.println("[fingerprint test] incarnation 1 job id=" + jobId1 + ", incarnation 2 job id=" + jobId2
+        + (jobId1.equals(jobId2) ? " (same raw id, as expected from two fresh id-generator watermarks)" : " (different raw ids this run)"));
+
+    executorB.start();
+    assertThat(executorB.triggerAcquisitionCycle()).containsExactly(jobId2);
+
+    // The point of this test: this must complete normally even when jobId1 and jobId2 happen to
+    // be the same string, because the two schemas' installation fingerprints differ.
+    awaitJobGone(managementService2, jobId2);
+  }
+
+  @Test
+  void aGenuineWorkflowIdCollisionIsDetectedAndFailsLoudlyInsteadOfSilentlySwallowingTheJob() throws Exception {
+    String dbName = "deliberate-collision-" + UUID.randomUUID();
+    String taskQueue = "flow-job-executor-test-" + UUID.randomUUID();
+    WorkflowClient workflowClient = newWorkflowClient();
+
+    executorA = new ClusterSafeJobExecutor(workflowClient, taskQueue, Long.MAX_VALUE / 2);
+    engineA = buildEngine(dbName, "node-A-" + dbName, executorA);
+    engineA.getRepositoryService().createDeployment().addString("asyncJobProcess.bpmn", PROCESS_XML).deploy();
+    ProcessInstance instance = engineA.getRuntimeService().startProcessInstanceByKey("asyncJobProcess");
+    ManagementService managementServiceA = engineA.getManagementService();
+    Job job = managementServiceA.createJobQuery().processInstanceId(instance.getId()).singleResult();
+    assertThat(job).isNotNull();
+    String jobId = job.getId();
+
+    // Deliberately reconstruct the exact workflow id a real dispatch of this job would derive,
+    // then seed an unrelated stale workflow under that literal id - simulating a genuine
+    // cross-incarnation collision directly, rather than waiting for one to occur naturally.
+    CommandExecutor commandExecutor =
+        ((ProcessEngineImpl) engineA).getProcessEngineConfiguration().getCommandExecutorTxRequired();
+    String installationFingerprint = commandExecutor.execute(new GetOrCreateInstallationFingerprintCmd());
+    String workflowId = ClusterSafeJobExecutor.workflowIdFor(installationFingerprint, jobId);
+
+    String unrelatedJobId = "unrelated-stale-job-" + UUID.randomUUID();
+    JobDispatchWorkflow staleWorkflow = workflowClient.newWorkflowStub(
+        JobDispatchWorkflow.class,
+        WorkflowOptions.newBuilder()
+            .setTaskQueue(taskQueue)
+            .setWorkflowId(workflowId)
+            .setMemo(Map.of(ClusterSafeJobExecutor.JOB_ID_MEMO_KEY, unrelatedJobId))
+            .build());
+    WorkflowClient.start(staleWorkflow::runJob, unrelatedJobId);
+
+    // Now dispatch the real job. No worker is started for taskQueue at all here - the point is
+    // purely what happens at dispatch time, not whether anything ever executes the stale
+    // workflow's activity.
+    assertThatThrownBy(executorA::triggerAcquisitionCycle)
+        .as("a workflow-id collision with an unrelated job's memo must fail loudly, never be "
+            + "silently swallowed as if it were this job's own retry")
+        .isInstanceOf(JobDispatchCollisionException.class)
+        .hasMessageContaining(jobId)
+        .hasMessageContaining(unrelatedJobId);
+
+    // Failing loudly, not silently: the real job must still be sitting there, claimed but not
+    // executed - exactly the "not lost, surfaced instead" outcome this fix is meant to produce.
+    assertThat(managementServiceA.createJobQuery().jobId(jobId).singleResult())
+        .as("the real job must not have silently vanished - it should still exist, awaiting a "
+            + "retry once the collision is resolved")
+        .isNotNull();
   }
 
   private static ProcessEngine buildEngine(String dbName, String engineName, ClusterSafeJobExecutor jobExecutor) {

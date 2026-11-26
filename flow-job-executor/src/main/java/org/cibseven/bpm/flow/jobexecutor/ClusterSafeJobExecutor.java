@@ -15,6 +15,7 @@ package org.cibseven.bpm.flow.jobexecutor;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -28,7 +29,9 @@ import org.cibseven.bpm.engine.impl.jobexecutor.JobExecutor;
 
 import io.temporal.client.WorkflowClient;
 import io.temporal.client.WorkflowExecutionAlreadyStarted;
+import io.temporal.client.WorkflowExecutionDescription;
 import io.temporal.client.WorkflowOptions;
+import io.temporal.client.WorkflowStub;
 import io.temporal.worker.Worker;
 import io.temporal.worker.WorkerFactory;
 
@@ -62,6 +65,10 @@ public class ClusterSafeJobExecutor extends JobExecutor {
 
   private static final Logger LOG = LoggerFactory.getLogger(ClusterSafeJobExecutor.class);
 
+  /** Package-private, not private: {@code ClusterSafeJobExecutorMultiNodeTest} needs the exact
+   * same memo key to seed a deliberate collision. */
+  static final String JOB_ID_MEMO_KEY = "flowJobExecutorJobId";
+
   /**
    * One task queue name shared by every engine node in the cluster. Must be identical across all
    * {@code ClusterSafeJobExecutor} instances that are meant to cooperate - a per-node queue name
@@ -75,6 +82,7 @@ public class ClusterSafeJobExecutor extends JobExecutor {
 
   private WorkerFactory workerFactory;
   private ScheduledExecutorService sweepExecutor;
+  private volatile String cachedInstallationFingerprint;
 
   public ClusterSafeJobExecutor(WorkflowClient workflowClient, String sharedTaskQueueName) {
     this(workflowClient, sharedTaskQueueName, 2000L);
@@ -206,30 +214,80 @@ public class ClusterSafeJobExecutor extends JobExecutor {
       claimedJobIds.addAll(batch);
     }
 
+    String installationFingerprint = installationFingerprint(commandExecutor);
     for (String jobId : claimedJobIds) {
-      dispatchToTemporal(jobId);
+      dispatchToTemporal(jobId, installationFingerprint);
     }
     return claimedJobIds;
   }
 
-  private void dispatchToTemporal(String jobId) {
+  /**
+   * Resolves (and caches for this executor's lifetime) the schema-scoped fingerprint used by
+   * {@link #workflowIdFor(String, String)}. Looked up lazily here, not in
+   * {@link #startExecutingJobs()}, because {@link #triggerAcquisitionCycle()} must work even for
+   * a node under test that never calls {@link #start()}.
+   */
+  private String installationFingerprint(CommandExecutor commandExecutor) {
+    String cached = cachedInstallationFingerprint;
+    if (cached != null) {
+      return cached;
+    }
+    String resolved = commandExecutor.execute(new GetOrCreateInstallationFingerprintCmd());
+    cachedInstallationFingerprint = resolved;
+    return resolved;
+  }
+
+  private void dispatchToTemporal(String jobId, String installationFingerprint) {
+    String workflowId = workflowIdFor(installationFingerprint, jobId);
     JobDispatchWorkflow workflow = workflowClient.newWorkflowStub(
         JobDispatchWorkflow.class,
         WorkflowOptions.newBuilder()
             .setTaskQueue(sharedTaskQueueName)
-            .setWorkflowId(workflowIdFor(jobId))
+            .setWorkflowId(workflowId)
+            .setMemo(Map.of(JOB_ID_MEMO_KEY, jobId))
             .build());
     try {
       WorkflowClient.start(workflow::runJob, jobId);
     } catch (WorkflowExecutionAlreadyStarted e) {
-      // A workflow for this job id is already running (started by this node on a previous
-      // acquisition tick, or - defense in depth, should not happen given the AcquireJobsCmd claim
-      // above - by another node). Not an error: exactly the dedupe this design relies on.
+      // A workflow already exists under this job's derived id. The installation fingerprint
+      // above already makes an unrelated collision from a different schema incarnation
+      // overwhelmingly unlikely, but §10 risk 12 was reopened specifically because this design
+      // once swallowed every such conflict uniformly - so confirm, rather than assume, that this
+      // is genuinely this job's own already-started execution (this node's previous acquisition
+      // tick, or - defense in depth - another node that claimed it first) before treating it as
+      // the dedupe this design relies on.
+      confirmThisIsOurOwnJobOrFailLoudly(jobId, workflowId);
     }
   }
 
-  private static String workflowIdFor(String jobId) {
-    return "flow-job:" + jobId;
+  private void confirmThisIsOurOwnJobOrFailLoudly(String jobId, String workflowId) {
+    String conflictingJobId;
+    try {
+      WorkflowStub existing = workflowClient.newUntypedWorkflowStub(workflowId);
+      WorkflowExecutionDescription description = existing.describe();
+      conflictingJobId = (String) description.getMemo(JOB_ID_MEMO_KEY, String.class);
+    } catch (RuntimeException describeFailure) {
+      throw new JobDispatchCollisionException(jobId, workflowId, describeFailure);
+    }
+    if (!jobId.equals(conflictingJobId)) {
+      throw new JobDispatchCollisionException(jobId, workflowId, conflictingJobId);
+    }
+    // conflictingJobId equals jobId: the existing workflow's own memo confirms it genuinely is
+    // this same job, already dispatched (this node's earlier tick, or another node that won the
+    // AcquireJobsCmd race) - the ordinary, intended dedupe case. Nothing more to do.
+  }
+
+  /** Package-private, not private: {@code ClusterSafeJobExecutorMultiNodeTest} needs to derive
+   * the exact same workflow id a real dispatch would, to deliberately reconstruct a collision. */
+  static String workflowIdFor(String installationFingerprint, String jobId) {
+    // Scoping the workflow id to this schema's installation fingerprint (see
+    // GetOrCreateInstallationFingerprintCmd), not just the raw job id, is what actually closes
+    // §10 risk 12's reopened gap: a job id alone can repeat across a schema reset (dev/staging
+    // reset, DR restore, blue/green cutover - CIB7's default DbIdGenerator reseeds its watermark
+    // on any freshly created schema, Postgres included, not only H2/tests), but the fingerprint
+    // changes in lockstep with every such reset, so a reused job id can no longer collide with a
+    // stale execution left over from a prior schema incarnation.
+    return "flow-job:" + installationFingerprint + ":" + jobId;
   }
 
 }
