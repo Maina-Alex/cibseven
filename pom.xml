@@ -141,6 +141,7 @@
         <module>flow-tools</module>
         <module>flow-ai-task</module>
         <module>flow-audit</module>
+        <module>flow-job-executor</module>
 
         <module>webapps</module>
 
@@ -201,6 +202,7 @@
         <module>flow-tools</module>
         <module>flow-ai-task</module>
         <module>flow-audit</module>
+        <module>flow-job-executor</module>
 
         <module>webapps</module>
 
