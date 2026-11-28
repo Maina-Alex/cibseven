@@ -1,0 +1,69 @@
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <parent>
+    <groupId>org.cibseven.bpm.springboot.project</groupId>
+    <artifactId>cibseven-bpm-spring-boot-starter-root</artifactId>
+    <version>3.1.0-SNAPSHOT</version>
+  </parent>
+
+  <groupId>org.cibseven.bpm.springboot</groupId>
+  <artifactId>cibseven-bpm-spring-boot-starter-flow-job-executor</artifactId>
+  <name>CIB seven - Spring Boot Starter - Flow Job Executor</name>
+  <description>
+    Optional Spring Boot auto-configuration wiring flow-job-executor's cluster-safe,
+    Temporal-backed JobExecutor replacement into a running application. Opt in via
+    cibseven.bpm.flow.job-executor.enabled=true. Fails application startup loudly if cluster mode
+    is enabled together with an IdGenerator that is not safe for clustering (see
+    docs/cib7-fork-engine-plan.md §6 and §10 risk 12 in the flow repo).
+  </description>
+
+  <dependencies>
+
+    <dependency>
+      <groupId>${project.groupId}</groupId>
+      <artifactId>cibseven-bpm-spring-boot-starter</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.cibseven.bpm</groupId>
+      <artifactId>cibseven-flow-job-executor</artifactId>
+      <version>${project.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>io.temporal</groupId>
+      <artifactId>temporal-sdk</artifactId>
+      <version>1.41.1</version>
+    </dependency>
+
+    <dependency>
+      <groupId>${project.groupId}</groupId>
+      <artifactId>cibseven-bpm-spring-boot-starter-test</artifactId>
+      <version>${project.version}</version>
+      <scope>test</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>com.h2database</groupId>
+      <artifactId>h2</artifactId>
+      <scope>test</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-jdbc</artifactId>
+      <scope>test</scope>
+    </dependency>
+
+  </dependencies>
+
+  <licenses>
+    <license>
+      <name>The Apache Software License, Version 2.0</name>
+      <url>http://www.apache.org/licenses/LICENSE-2.0.txt</url>
+    </license>
+  </licenses>
+
+</project>
