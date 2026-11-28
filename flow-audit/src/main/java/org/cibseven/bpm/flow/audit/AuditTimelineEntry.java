@@ -27,7 +27,8 @@ public record AuditTimelineEntry(Date timestamp, String actorId, Type type, Stri
     VARIABLE_UPDATE,
     TASK_CREATED,
     TASK_COMPLETED,
-    COMMENT
+    COMMENT,
+    CASE_EVENT
   }
 
 }

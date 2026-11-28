@@ -142,6 +142,7 @@
         <module>flow-ai-task</module>
         <module>flow-audit</module>
         <module>flow-job-executor</module>
+        <module>flow-casework</module>
 
         <module>webapps</module>
 
@@ -203,6 +204,7 @@
         <module>flow-ai-task</module>
         <module>flow-audit</module>
         <module>flow-job-executor</module>
+        <module>flow-casework</module>
 
         <module>webapps</module>
 
